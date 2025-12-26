@@ -6,10 +6,11 @@ app.use(express.json())
 
 /**
  * ================================
- * SIMPLE TOKEN STORE (IN-MEMORY)
+ * TOKEN STORE EN MEMORIA (CACHE)
  * locationId -> access_token
  * ================================
- * En producción: usar DB
+ * Puede perderse si Render duerme,
+ * pero se auto-recupera desde GHL.
  */
 const locationTokenStore = {}
 
@@ -17,11 +18,13 @@ const locationTokenStore = {}
  * Health check
  */
 app.get("/", (req, res) => {
-  res.send("Backend OAuth GHL activo")
+  res.send("Backend OAuth GHL activo (robusto)")
 })
 
 /**
+ * ================================
  * STEP 1 – Iniciar OAuth
+ * ================================
  */
 app.get("/oauth/start", (req, res) => {
   const scopes = [
@@ -44,7 +47,9 @@ app.get("/oauth/start", (req, res) => {
 })
 
 /**
+ * ================================
  * STEP 2 – OAuth Callback
+ * ================================
  */
 app.get("/oauth/callback", async (req, res) => {
   try {
@@ -53,7 +58,7 @@ app.get("/oauth/callback", async (req, res) => {
       return res.status(400).send("Authorization code no recibido")
     }
 
-    // Intercambiar code por token
+    // Intercambiar code por token (x-www-form-urlencoded)
     const params = new URLSearchParams()
     params.append("client_id", process.env.CLIENT_ID)
     params.append("client_secret", process.env.CLIENT_SECRET)
@@ -79,7 +84,7 @@ app.get("/oauth/callback", async (req, res) => {
     } = tokenResponse.data
 
     /**
-     * Guardar token por subcuenta
+     * Guardar token en memoria (cache)
      */
     locationTokenStore[locationId] = {
       access_token,
@@ -88,9 +93,10 @@ app.get("/oauth/callback", async (req, res) => {
     }
 
     /**
-     * Crear / actualizar custom value en la subcuenta
+     * Crear o actualizar custom value en la subcuenta
      */
     try {
+      // Intentar crear
       await axios.post(
         `https://services.leadconnectorhq.com/locations/${locationId}/customValues`,
         {
@@ -106,6 +112,7 @@ app.get("/oauth/callback", async (req, res) => {
         }
       )
     } catch (err) {
+      // Si ya existe, actualizar
       if (err.response?.data?.message?.includes("already exists")) {
         await axios.put(
           `https://services.leadconnectorhq.com/locations/${locationId}/customValues/location_access_token`,
@@ -128,7 +135,7 @@ app.get("/oauth/callback", async (req, res) => {
     res.send(`
       <h2>OAuth instalado correctamente</h2>
       <p><b>Location ID:</b> ${locationId}</p>
-      <p>Token guardado y Custom Value creado / actualizado</p>
+      <p>Custom Value <b>location_access_token</b> creado / actualizado</p>
     `)
 
   } catch (error) {
@@ -138,27 +145,58 @@ app.get("/oauth/callback", async (req, res) => {
 })
 
 /**
- * STEP 3 – Recibir survey desde workflow base
+ * ================================
+ * STEP 3 – Procesar Survey
+ * (ROBUSTO: se auto-recupera)
+ * ================================
  */
 app.post("/process-survey", async (req, res) => {
   try {
     const { locationId, contact } = req.body
 
     if (!locationId || !contact) {
-      return res.status(400).json({ error: "locationId o contact faltante" })
-    }
-
-    const tokenData = locationTokenStore[locationId]
-    if (!tokenData) {
       return res.status(400).json({
-        error: "La subcuenta no tiene la app OAuth instalada"
+        error: "locationId o contact faltante"
       })
     }
 
-    const accessToken = tokenData.access_token
+    let tokenData = locationTokenStore[locationId]
 
     /**
-     * Upsert contacto en la subcuenta destino
+     * 🔁 AUTO-RECUPERACIÓN
+     * Si Render se durmió y no hay token en memoria,
+     * leerlo desde el Custom Value usando el AGENCY TOKEN
+     */
+    if (!tokenData) {
+      try {
+        const cvResponse = await axios.get(
+          `https://services.leadconnectorhq.com/locations/${locationId}/customValues/location_access_token`,
+          {
+            headers: {
+              Authorization: `Bearer ${process.env.AGENCY_TOKEN}`,
+              Version: "2021-07-28"
+            }
+          }
+        )
+
+        const accessToken = cvResponse.data.value
+
+        // Rehidratar cache
+        locationTokenStore[locationId] = {
+          access_token: accessToken
+        }
+
+        tokenData = locationTokenStore[locationId]
+
+      } catch (err) {
+        return res.status(400).json({
+          error: "La subcuenta no tiene la app OAuth instalada o no existe el token"
+        })
+      }
+    }
+
+    /**
+     * Upsert del contacto en la subcuenta destino
      */
     await axios.post(
       "https://services.leadconnectorhq.com/contacts/upsert",
@@ -178,18 +216,26 @@ app.post("/process-survey", async (req, res) => {
       },
       {
         headers: {
-          Authorization: `Bearer ${accessToken}`,
+          Authorization: `Bearer ${tokenData.access_token}`,
           Version: "2021-07-28",
           "Content-Type": "application/json"
         }
       }
     )
 
-    res.json({ status: "OK", message: "Contacto creado / actualizado" })
+    res.json({
+      status: "OK",
+      message: "Contacto creado / actualizado (robusto)"
+    })
 
   } catch (error) {
-    console.error("PROCESS SURVEY ERROR:", error.response?.data || error.message)
-    res.status(500).json({ error: "Error procesando survey" })
+    console.error(
+      "PROCESS SURVEY ERROR:",
+      error.response?.data || error.message
+    )
+    res.status(500).json({
+      error: "Error procesando survey"
+    })
   }
 })
 
